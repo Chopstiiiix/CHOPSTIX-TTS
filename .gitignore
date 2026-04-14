@@ -1,0 +1,10 @@
+data/
+checkpoints/
+*.wav
+*.flac
+*.mp3
+*.parquet
+__pycache__/
+*.pyc
+.env
+*.safetensors
