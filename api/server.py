@@ -1,11 +1,24 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-import torch, torchaudio, io, os, subprocess
+import io, os, subprocess
 from pathlib import Path
+import soundfile as sf
+import numpy as np
+import torch
+import torchaudio
+
+def _soundfile_load(uri, *args, **kwargs):
+    data, sr = sf.read(str(uri), always_2d=False)
+    if data.ndim == 1:
+        data = data[np.newaxis, :]
+    else:
+        data = data.T
+    return torch.tensor(data, dtype=torch.float32), sr
+
+torchaudio.load = _soundfile_load
 
 app = FastAPI(title="Chopstix TTS API", version="1.0.0")
-
 MODEL = None
 VOICES_DIR = Path("voices")
 
@@ -17,10 +30,10 @@ class SynthesizeRequest(BaseModel):
 @app.on_event("startup")
 async def load_model():
     global MODEL
-    print("Loading Chopstix TTS model...")
+    print("Loading Chopstix TTS model on Apple MPS...")
     from f5_tts.api import F5TTS
-    MODEL = F5TTS(model="F5TTS_v1_Base")
-    print("Model loaded successfully")
+    MODEL = F5TTS(model="F5TTS_v1_Base", device="mps")
+    print("Model loaded on MPS successfully")
 
 @app.get("/health")
 def health():
@@ -38,34 +51,33 @@ async def synthesize(req: SynthesizeRequest):
     ref_path = VOICES_DIR / f"{req.voice_id}.wav"
     if not ref_path.exists():
         raise HTTPException(404, f"Voice {req.voice_id} not found")
-    wav, sr, _ = MODEL.infer(
-        ref_file=str(ref_path),
-        ref_text="",
-        gen_text=req.text,
-        file_wave="/tmp/out.wav"
-    )
-    result = subprocess.run([
-        "ffmpeg", "-y", "-i", "/tmp/out.wav",
-        "-af", "loudnorm=I=-16:TP=-1.5:LRA=11,equalizer=f=8000:width_type=o:width=2:g=-4,equalizer=f=12000:width_type=o:width=2:g=-3",
-        "/tmp/out_clean.wav"
-    ], capture_output=True)
-    with open("/tmp/out_clean.wav", "rb") as f:
-        buf = io.BytesIO(f.read())
-    buf.seek(0)
-    return StreamingResponse(buf, media_type="audio/wav",
-        headers={"Content-Disposition": f"attachment; filename={req.voice_id}.wav"})
+    try:
+        wav, sr, _ = MODEL.infer(
+            ref_file=str(ref_path),
+            ref_text="",
+            gen_text=req.text,
+            file_wave="/tmp/out.wav"
+        )
+        subprocess.run([
+            "ffmpeg", "-y", "-i", "/tmp/out.wav",
+            "-af", "loudnorm=I=-16:TP=-1.5:LRA=11,equalizer=f=8000:width_type=o:width=2:g=-4,equalizer=f=12000:width_type=o:width=2:g=-3",
+            "/tmp/out_clean.wav"
+        ], capture_output=True)
+        with open("/tmp/out_clean.wav", "rb") as f:
+            buf = io.BytesIO(f.read())
+        buf.seek(0)
+        return StreamingResponse(buf, media_type="audio/wav",
+            headers={"Content-Disposition": f"attachment; filename={req.voice_id}.wav"})
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 @app.post("/clone")
-async def clone_voice(
-    voice_name: str,
-    reference_audio: UploadFile = File(...)
-):
+async def clone_voice(voice_name: str, reference_audio: UploadFile = File(...)):
     ref_bytes = await reference_audio.read()
-    ref_path = VOICES_DIR / f"{voice_name}.wav"
     with open(f"/tmp/{voice_name}_raw.wav", "wb") as f:
         f.write(ref_bytes)
     subprocess.run([
         "ffmpeg", "-y", "-i", f"/tmp/{voice_name}_raw.wav",
-        "-ar", "24000", "-ac", "1", str(ref_path)
+        "-ar", "24000", "-ac", "1", str(VOICES_DIR / f"{voice_name}.wav")
     ], capture_output=True)
     return {"status": "ok", "voice_id": voice_name}
